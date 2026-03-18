@@ -44,6 +44,7 @@ The fix: **Admin creates a system-level service** (using system systemd, which I
 | `systemctl --user` | ✅ Works | ❌ Doesn't work |
 | Solution | `systemctl --user enable docker` | Admin creates system service |
 | Docker socket path | `/run/user/1001/docker.sock` | `/home/dockeruser/.docker/run/docker.sock` |
+| cgroup delegation | ✅ Auto-handled by user session | ❌ Must be explicitly granted — or containers crash |
 | App survives logout | ✅ Yes (with linger) | ✅ Yes (with system service) |
 
 ---
@@ -74,6 +75,8 @@ Fresh Ubuntu 24.04 EC2 Instance
 [SWITCH BACK TO ADMIN]
         ↓
 [ADMIN] Create system-level service for dockerd-rootless
+        ↓
+[ADMIN] Enable cgroup Delegation  ← required on EC2, or containers crash
         ↓
 [ADMIN] Enable + Start the service
         ↓
@@ -397,6 +400,7 @@ ExecStartPre=/bin/mkdir -p /home/dockeruser/.docker/run
 ExecStart=/usr/bin/dockerd-rootless.sh
 Restart=always
 RestartSec=5
+Delegate=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -410,16 +414,49 @@ WantedBy=multi-user.target
 | `ExecStart=dockerd-rootless.sh` | The actual rootless Docker daemon |
 | `Restart=always` | Auto-restarts if Docker crashes |
 | `RestartSec=5` | Waits 5 seconds before restarting |
+| `Delegate=yes` | Allows the service to manage its own cgroup subtree — **required on EC2**, otherwise every `docker run` fails with "unable to apply cgroup configuration" |
 | `WantedBy=multi-user.target` | Starts at boot, at the normal runlevel |
 
 Save and exit: `Ctrl+O` → `Enter` → `Ctrl+X`
 
 ---
 
-### Step 15 — Enable and Start the Service
+### Step 15 — Enable cgroup Delegation for the User Slice ← Don't Skip on EC2!
+
+This is what was causing the container crash:
+
+```
+unable to apply cgroup configuration: unable to start unit... Interactive authentication required
+```
+
+On EC2, when Docker (running as a system service) tries to create a cgroup scope for each container, systemd blocks it unless delegation is explicitly granted. Two things are needed:
+
+**`Delegate=yes` in the service file** (already added in Step 14) tells systemd this service is allowed to manage its own cgroup subtree.
+
+**The user slice config** tells systemd which cgroup controllers to hand over to processes running under `dockeruser`:
 
 ```bash
-# Reload systemd so it knows about the new service
+sudo mkdir -p /etc/systemd/system/user@.service.d/
+sudo nano /etc/systemd/system/user@.service.d/delegate.conf
+```
+
+Paste this:
+
+```ini
+[Service]
+Delegate=cpu cpuset io memory pids
+```
+
+Save and exit: `Ctrl+O` → `Enter` → `Ctrl+X`
+
+**What this does:** Grants `dockeruser`'s processes full control over the `cpu`, `cpuset`, `io`, `memory`, and `pids` cgroup controllers — exactly what Docker needs to isolate containers. Without this, every `docker run` fails even if the daemon is running fine.
+
+---
+
+### Step 16 — Enable and Start the Service
+
+```bash
+# Reload systemd so it picks up both the service file AND the delegate.conf
 sudo systemctl daemon-reload
 
 # Enable it — auto-starts on every boot
@@ -431,7 +468,7 @@ sudo systemctl start docker-rootless-dockeruser
 
 ---
 
-### Step 16 — Verify the Service Is Running
+### Step 17 — Verify the Service Is Running
 
 ```bash
 sudo systemctl status docker-rootless-dockeruser
@@ -463,7 +500,7 @@ Switch back to `dockeruser`:
 su - dockeruser
 ```
 
-### Step 17 — Run the Hello World Container
+### Step 18 — Run the Hello World Container
 
 ```bash
 docker run hello-world
@@ -485,7 +522,7 @@ To generate this message, Docker took the following steps:
 
 ---
 
-### Step 18 — Confirm It's Actually Rootless
+### Step 19 — Confirm It's Actually Rootless
 
 ```bash
 docker info | grep -i rootless
@@ -499,7 +536,7 @@ Expected output:
 
 ---
 
-### Step 19 — Prove the App Survives Logout
+### Step 20 — Prove the App Survives Logout
 
 This is the ultimate test. Start a container in the background:
 
@@ -525,7 +562,7 @@ The container survived the logout because Docker is now managed by the system se
 
 ---
 
-### Step 20 — Run a Real Container (Extra Proof)
+### Step 21 — Run a Real Container (Extra Proof)
 
 ```bash
 docker run -it ubuntu:24.04 bash
@@ -607,13 +644,21 @@ source ~/.bashrc
 mkdir -p /home/dockeruser/.docker/run
 
 # ══════════════════════════════════════════════════════════════
-# PHASE 5: BACK TO ADMIN — Create System Service
+# PHASE 5: BACK TO ADMIN — Create System Service + cgroup Fix
 # ══════════════════════════════════════════════════════════════
 exit   # back to admin
 
+# Create the system service file (with Delegate=yes inside)
 sudo nano /etc/systemd/system/docker-rootless-dockeruser.service
 # Paste the service file content (see Phase 5, Step 14)
 
+# Create cgroup delegation config — REQUIRED on EC2 or containers crash
+sudo mkdir -p /etc/systemd/system/user@.service.d/
+sudo nano /etc/systemd/system/user@.service.d/delegate.conf
+# Paste: [Service]
+#        Delegate=cpu cpuset io memory pids
+
+# Reload systemd (picks up both files), enable and start
 sudo systemctl daemon-reload
 sudo systemctl enable docker-rootless-dockeruser
 sudo systemctl start docker-rootless-dockeruser
@@ -649,7 +694,8 @@ docker ps           # still running after logout ✅
 | Volume mounts | ✅ Works | No changes needed |
 | Docker Hub / pulling images | ✅ Works | No changes needed |
 | Survives logout | ✅ Works | System service handles it (Phase 5) |
-| Survives reboot | ✅ Works | `systemctl enable` in Step 15 |
+| Survives reboot | ✅ Works | `systemctl enable` in Step 16 |
+| cgroup for containers | ✅ Works | `Delegate=yes` + delegate.conf in Step 15 |
 | Auto-restarts on crash | ✅ Works | `Restart=always` in service file |
 
 ---
@@ -660,4 +706,5 @@ docker ps           # still running after logout ✅
 > Docker Version: 27.x (Rootless)  
 > ✅ dockeruser has zero sudo privileges  
 > ✅ Docker survives logout and reboots via system service  
-> ✅ EC2 / no-systemd-user-session fully handled
+> ✅ EC2 / no-systemd-user-session fully handled  
+> ✅ cgroup delegation fixed — containers run without errors
