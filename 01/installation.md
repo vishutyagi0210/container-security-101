@@ -1,5 +1,5 @@
-# 🐧 Ubuntu 24.04 VM → Create User → Docker Rootless Setup
-### A Complete Personal Guide — From Fresh VM to Running Containers
+# 🐧 Ubuntu 24.04 (AWS EC2) → Create User → Docker Rootless Setup
+### A Complete Personal Guide — From Fresh Instance to Running Containers
 
 ---
 
@@ -14,35 +14,68 @@ So the rule is simple:
 
 | Who | What They Do | Has Sudo? |
 |---|---|---|
-| **Admin/root** | System setup, install Docker engine, create user, prep dependencies | ✅ Yes |
+| **Admin/root** | System setup, install Docker, create user, create system service | ✅ Yes |
 | **dockeruser** | Runs Docker, runs containers — nothing else | ❌ Never |
+
+---
+
+## ⚠️ EC2 vs Regular VM — Important Difference
+
+On a regular Ubuntu VM or desktop, Docker rootless uses **systemd user sessions** to manage the daemon automatically.
+
+**On AWS EC2, systemd user sessions are NOT available for non-root users.** So when you run `dockerd-rootless-setuptool.sh install` on EC2 you will see:
+
+```
+[INFO] systemd not detected, dockerd-rootless.sh needs to be started manually:
+PATH=/usr/bin:/sbin:/usr/sbin:$PATH dockerd-rootless.sh
+```
+
+This is **not an error** — it's just telling you systemd user mode isn't available.
+
+The fix: **Admin creates a system-level service** (using system systemd, which IS available) that runs `dockerd-rootless.sh` as `dockeruser`. This way:
+- Docker starts automatically on boot
+- Docker keeps running even when `dockeruser` is logged out
+- If Docker crashes, it auto-restarts
+- `dockeruser` still has zero sudo
+
+| | Regular VM | AWS EC2 |
+|---|---|---|
+| Systemd user session | ✅ Available | ❌ Not available |
+| `systemctl --user` | ✅ Works | ❌ Doesn't work |
+| Solution | `systemctl --user enable docker` | Admin creates system service |
+| Docker socket path | `/run/user/1001/docker.sock` | `/home/dockeruser/.docker/run/docker.sock` |
+| App survives logout | ✅ Yes (with linger) | ✅ Yes (with system service) |
 
 ---
 
 ## 🗺️ The Full Roadmap
 
 ```
-Fresh Ubuntu 24.04 VM
+Fresh Ubuntu 24.04 EC2 Instance
         ↓
 [ADMIN] Update the System
         ↓
 [ADMIN] Install Essential Tools
         ↓
-[ADMIN] Create dockeruser  ← NO sudo given to this user
+[ADMIN] Create dockeruser  ← NO sudo, ever
         ↓
 [ADMIN] Install Docker Engine
         ↓
-[ADMIN] Install docker-ce-rootless-extras
+[ADMIN] Install docker-ce-rootless-extras  ← where the setup script lives
         ↓
-[ADMIN] Install Rootless Dependencies  ← must be done before switching user
-        ↓
-[ADMIN] Enable Linger for dockeruser   ← requires root, do it now
+[ADMIN] Install Rootless Dependencies (uidmap, slirp4netns, etc.)
         ↓
 [SWITCH] su - dockeruser
         ↓
-[dockeruser] Setup Docker Rootless
+[dockeruser] Run dockerd-rootless-setuptool.sh install
         ↓
-[dockeruser] Set Environment Variables
+[dockeruser] Set Environment Variables in ~/.bashrc
+        ↓
+[SWITCH BACK TO ADMIN]
+        ↓
+[ADMIN] Create system-level service for dockerd-rootless
+        ↓
+[ADMIN] Enable + Start the service
         ↓
 [dockeruser] Test & Verify ✅
 ```
@@ -53,7 +86,7 @@ Fresh Ubuntu 24.04 VM
 
 ### Step 1 — First Login & Update Everything
 
-When you first log in to your Ubuntu VM (usually as `root` or a default admin user), always update first:
+When you first log in to your EC2 instance (usually as `ubuntu` user), always update first:
 
 ```bash
 sudo apt-get update && sudo apt-get upgrade -y
@@ -62,7 +95,7 @@ sudo apt-get update && sudo apt-get upgrade -y
 **What this does:**
 - `apt-get update` — Refreshes the list of available packages
 - `apt-get upgrade -y` — Installs all updates automatically
-- Always do this on a fresh VM before installing anything
+- Always do this on a fresh instance before installing anything
 
 **Proof it worked:** No errors in output. Ends with something like:
 ```
@@ -77,12 +110,11 @@ sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y curl wget git nano
 ```
 
-**What each tool is:**
 | Tool | Why You Need It |
 |---|---|
 | `curl` | Downloads files/scripts from the internet |
 | `wget` | Another download tool (good backup) |
-| `git` | Version control (you'll need it) |
+| `git` | Version control |
 | `nano` | Simple terminal text editor |
 
 ---
@@ -95,9 +127,9 @@ sudo apt-get install -y curl wget git nano
 sudo adduser dockeruser
 ```
 
-> 💡 Replace `dockeruser` with whatever username you want — `devuser`, `john`, etc.
+> 💡 Replace `dockeruser` with whatever username you want.
 
-**What happens:** Ubuntu will ask you a few questions:
+Ubuntu will ask you a few questions:
 
 ```
 Adding user `dockeruser' ...
@@ -107,11 +139,11 @@ Adding new home directory `/home/dockeruser' ...
 New password:          ← type a strong password
 Retype new password:   ← confirm it
 
-Full Name []:     ← optional, press Enter to skip
-Room Number []:   ← press Enter
-Work Phone []:    ← press Enter
-Home Phone []:    ← press Enter
-Other []:         ← press Enter
+Full Name []:          ← press Enter to skip
+Room Number []:        ← press Enter
+Work Phone []:         ← press Enter
+Home Phone []:         ← press Enter
+Other []:              ← press Enter
 
 Is the information correct? [Y/n]  ← type Y and Enter
 ```
@@ -143,7 +175,7 @@ If `dockeruser` could run `sudo`, they could just `sudo su` and become root inst
 sudo usermod -aG systemd-journal dockeruser
 ```
 
-This lets `dockeruser` read system logs — helpful for debugging Docker later. This is the **only** group addition needed, and it does NOT grant any elevated privileges.
+This lets `dockeruser` read system logs — helpful for debugging Docker later. This does NOT grant any elevated privileges.
 
 ---
 
@@ -158,7 +190,7 @@ Expected output:
 dockeruser : dockeruser systemd-journal
 ```
 
-✅ You should **NOT** see `sudo` in this list. If you do — you made a mistake in Step 4.
+✅ You should **NOT** see `sudo` in this list. If you do, you made a mistake in Step 4.
 
 ---
 
@@ -166,18 +198,10 @@ dockeruser : dockeruser systemd-journal
 
 ### Step 7 — Download and Run Docker's Official Installer
 
-Still as your admin user, install Docker Engine:
-
 ```bash
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
 ```
-
-**What the flags mean:**
-- `-f` — Fail silently on HTTP errors
-- `-s` — Silent mode
-- `-S` — Still show errors if they happen
-- `-L` — Follow redirects
 
 **This installs:**
 - `docker-ce` — Docker Community Edition (the engine)
@@ -196,9 +220,9 @@ Docker version 27.x.x, build xxxxxxx
 
 ---
 
-### Step 8 — Install docker-ce-rootless-extras ← Critical Step!
+### Step 8 — Install docker-ce-rootless-extras ← Critical, Don't Skip!
 
-This package is **required and often missed**. The `dockerd-rootless-setuptool.sh` script — which actually sets up rootless mode — lives inside this package:
+The `dockerd-rootless-setuptool.sh` and `dockerd-rootless.sh` scripts live inside this package. Without it, rootless mode simply doesn't exist:
 
 ```bash
 sudo apt-get install -y docker-ce-rootless-extras
@@ -207,13 +231,13 @@ sudo apt-get install -y docker-ce-rootless-extras
 **Proof it worked:**
 ```bash
 which dockerd-rootless-setuptool.sh
+which dockerd-rootless.sh
 ```
 Expected output:
 ```
 /usr/bin/dockerd-rootless-setuptool.sh
+/usr/bin/dockerd-rootless.sh
 ```
-
-If this returns nothing, the rootless setup in Phase 4 will fail with "command not found". ✅
 
 ---
 
@@ -223,48 +247,24 @@ If this returns nothing, the rootless setup in Phase 4 will fail with "command n
 sudo apt-get install -y uidmap dbus-user-session slirp4netns
 ```
 
-> ⚠️ **This MUST be done by admin BEFORE switching to dockeruser.**
+> ⚠️ **MUST be done by admin BEFORE switching to dockeruser.**
 > `dockeruser` has no sudo and cannot install packages themselves.
 
-**What each package does:**
 | Package | Purpose |
 |---|---|
 | `uidmap` | Maps user IDs — lets Docker create isolated user namespaces without root |
-| `dbus-user-session` | Lets a non-root user run background services like the Docker daemon |
-| `slirp4netns` | Provides user-space networking for rootless containers — needed for internet access inside containers |
-
----
-
-### Step 10 — Enable Linger for dockeruser (Admin Must Do This!)
-
-```bash
-sudo loginctl enable-linger dockeruser
-```
-
-> ⚠️ **This also MUST be done by admin.** It requires root privileges and `dockeruser` can't run it themselves.
-
-**What this does:** Allows `dockeruser`'s systemd services (like the Docker daemon) to keep running even when they're not actively logged in. Without this, Docker shuts down the moment `dockeruser` logs out.
-
-**Proof it worked:**
-```bash
-loginctl show-user dockeruser | grep Linger
-```
-Expected output:
-```
-Linger=yes
-```
+| `dbus-user-session` | Lets a non-root user run background services |
+| `slirp4netns` | User-space networking for rootless containers — needed for internet access inside containers |
 
 ---
 
 ## 🔐 Phase 4 — Setup Docker Rootless (As dockeruser — Zero Sudo!)
 
-Now switch to the new user. **From this point forward, NO sudo is used at all.**
+Switch to the new user. **From this point forward, NO sudo is used at all.**
 
 ```bash
 su - dockeruser
 ```
-
-The `-` means it's a **full login switch** — loads the user's environment and starts from their home directory.
 
 **Proof you switched:**
 ```bash
@@ -277,88 +277,193 @@ dockeruser
 
 ---
 
-### Step 11 — Run the Rootless Setup Script
+### Step 10 — Run the Rootless Setup Script
 
 ```bash
 dockerd-rootless-setuptool.sh install
 ```
 
-> ✅ No `sudo`. No root. Just run it directly as `dockeruser`.
+> ✅ No `sudo`. No root. Run it directly as `dockeruser`.
 
-**What this does:**
-- Sets up a private Docker daemon that belongs only to `dockeruser`
-- Creates a user-level systemd service at `~/.config/systemd/user/docker.service`
-- Configures user namespaces using `uidmap`
+**On EC2, the expected output will be:**
+```
+[INFO] systemd not detected, dockerd-rootless.sh needs to be started manually:
+PATH=/usr/bin:/sbin:/usr/sbin:$PATH dockerd-rootless.sh
+[INFO] CLI context "rootless" already exists
+[INFO] Using CLI context "rootless"
+Current context is now "rootless"
+[INFO] Make sure the following environment variable(s) are set (or add them to ~/.bashrc):
+# WARNING: systemd not found. You have to remove XDG_RUNTIME_DIR manually on every logout.
+export XDG_RUNTIME_DIR=/home/dockeruser/.docker/run
+export PATH=/usr/bin:$PATH
+[INFO] Some applications may require the following environment variable too:
+export DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock
+```
 
-**Proof it worked — expected output:**
-```
-[INFO] Creating /home/dockeruser/.config/systemd/user/docker.service
-[INFO] starting systemd service docker.service
-+ systemctl --user start docker.service
-+ systemctl --user enable docker.service
-[INFO] Docker is now available as a rootless daemon.
-```
-
-**If you see an error about `newuidmap` or `newgidmap`:**
-Switch back to admin and run:
-```bash
-sudo apt-get install -y uidmap
-```
-Then switch back to `dockeruser` and retry.
+✅ This is **correct and expected on EC2** — not an error. The "systemd not detected" message just means we'll use the system-level service approach (done by admin in Phase 5).
 
 ---
 
-### Step 12 — Set Environment Variables
+### Step 11 — Set Environment Variables
+
+Based on exactly what the setup script told you, add these to `~/.bashrc`:
 
 ```bash
-echo 'export PATH=/usr/bin:$PATH' >> ~/.bashrc
-echo 'export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' >> ~/.bashrc
+echo 'export XDG_RUNTIME_DIR=/home/dockeruser/.docker/run' >> ~/.bashrc
+echo 'export PATH=/usr/bin:/sbin:/usr/sbin:$PATH' >> ~/.bashrc
+echo 'export DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-**What each line does:**
-- `PATH` → Makes sure the terminal finds the right Docker binary
-- `DOCKER_HOST` → Points Docker CLI to the **user-level** socket, not the system root socket
-- `source ~/.bashrc` → Applies changes immediately without logging out
+**What each variable does:**
+| Variable | Purpose |
+|---|---|
+| `XDG_RUNTIME_DIR` | Tells Docker where to create its socket and runtime files |
+| `PATH` | Makes sure all Docker binaries are findable |
+| `DOCKER_HOST` | Tells the Docker CLI exactly where the daemon socket is |
 
-**Verify the variable is set:**
+**Proof they're set:**
 ```bash
+echo $XDG_RUNTIME_DIR
 echo $DOCKER_HOST
 ```
 Expected output:
 ```
-unix:///run/user/1001/docker.sock
+/home/dockeruser/.docker/run
+unix:///home/dockeruser/.docker/run/docker.sock
 ```
-The number `1001` is `dockeruser`'s UID — it may differ on your system.
 
 ---
 
-### Step 13 — Enable Docker to Auto-Start on Login
+### Step 12 — Create the Runtime Directory
 
 ```bash
-systemctl --user enable docker
+mkdir -p /home/dockeruser/.docker/run
 ```
 
-> ✅ The `--user` flag means this operates only on `dockeruser`'s own services. No sudo needed.
+This is where the Docker socket will live. The system service will also create this automatically, but good to have it ready.
 
-**What this does:** Auto-starts the rootless Docker daemon every time `dockeruser` logs in.
+---
 
-**Proof:**
+## 🛠️ Phase 5 — Create System Service (Back to Admin!)
+
+Switch back to your admin user. This is the key phase that makes Docker survive logouts and reboots.
+
 ```bash
-systemctl --user status docker
+exit   # or open a new terminal as admin
 ```
+
+### Step 13 — Why Not Just Use `.bashrc` to Start Docker?
+
+You might think: just add `dockerd-rootless.sh &` to `~/.bashrc` and be done.
+
+**The problem:**
+
+```
+dockeruser logs in → .bashrc starts dockerd → app runs
+dockeruser logs OUT → session ends → dockerd dies → app CRASHES 💥
+EC2 reboots → dockerd never starts → app never runs 💥
+```
+
+**The solution:** A proper **system-level** service that:
+- Starts at boot, independently of any login
+- Runs `dockerd-rootless.sh` as `dockeruser` (still rootless!)
+- Keeps Docker alive even when `dockeruser` is completely logged out
+- Auto-restarts if Docker ever crashes
+
+---
+
+### Step 14 — Create the System Service File
+
+```bash
+sudo nano /etc/systemd/system/docker-rootless-dockeruser.service
+```
+
+Paste this exactly:
+
+```ini
+[Unit]
+Description=Docker Rootless Daemon (dockeruser)
+After=network.target
+
+[Service]
+Type=simple
+User=dockeruser
+Environment=HOME=/home/dockeruser
+Environment=XDG_RUNTIME_DIR=/home/dockeruser/.docker/run
+Environment=PATH=/usr/bin:/sbin:/usr/sbin:/usr/local/bin
+Environment=DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock
+ExecStartPre=/bin/mkdir -p /home/dockeruser/.docker/run
+ExecStart=/usr/bin/dockerd-rootless.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**What each section means:**
+| Setting | What It Does |
+|---|---|
+| `User=dockeruser` | Runs the daemon as `dockeruser` — NOT as root |
+| `ExecStartPre=mkdir` | Creates the socket directory before starting |
+| `ExecStart=dockerd-rootless.sh` | The actual rootless Docker daemon |
+| `Restart=always` | Auto-restarts if Docker crashes |
+| `RestartSec=5` | Waits 5 seconds before restarting |
+| `WantedBy=multi-user.target` | Starts at boot, at the normal runlevel |
+
+Save and exit: `Ctrl+O` → `Enter` → `Ctrl+X`
+
+---
+
+### Step 15 — Enable and Start the Service
+
+```bash
+# Reload systemd so it knows about the new service
+sudo systemctl daemon-reload
+
+# Enable it — auto-starts on every boot
+sudo systemctl enable docker-rootless-dockeruser
+
+# Start it right now
+sudo systemctl start docker-rootless-dockeruser
+```
+
+---
+
+### Step 16 — Verify the Service Is Running
+
+```bash
+sudo systemctl status docker-rootless-dockeruser
+```
+
 Expected output:
 ```
-● docker.service - Docker Application Container Engine (Rootless)
-     Loaded: loaded (/home/dockeruser/.config/systemd/user/docker.service)
+● docker-rootless-dockeruser.service - Docker Rootless Daemon (dockeruser)
+     Loaded: loaded (/etc/systemd/system/docker-rootless-dockeruser.service)
      Active: active (running) since ...
+   Main PID: XXXX (dockerd-rootless.)
 ```
+
+Also verify the process is owned by `dockeruser`, NOT root:
+
+```bash
+ps aux | grep dockerd
+```
+
+You should see `dockerd` listed under `dockeruser`. ✅
 
 ---
 
-## ✅ Phase 5 — Final Testing & Proof (Still as dockeruser)
+## ✅ Phase 6 — Final Testing & Proof (As dockeruser)
 
-### Step 14 — Run the Hello World Container
+Switch back to `dockeruser`:
+
+```bash
+su - dockeruser
+```
+
+### Step 17 — Run the Hello World Container
 
 ```bash
 docker run hello-world
@@ -380,7 +485,7 @@ To generate this message, Docker took the following steps:
 
 ---
 
-### Step 15 — Confirm It's Actually Running Rootless
+### Step 18 — Confirm It's Actually Rootless
 
 ```bash
 docker info | grep -i rootless
@@ -392,26 +497,44 @@ Expected output:
  Security Options: rootless
 ```
 
-Confirm the daemon is NOT running as root:
+---
+
+### Step 19 — Prove the App Survives Logout
+
+This is the ultimate test. Start a container in the background:
 
 ```bash
-ps aux | grep dockerd
+docker run -d --name test-survivor nginx
+docker ps   # confirm it's running
 ```
 
-You should see `dockerd` running under **`dockeruser`**, NOT `root`. ✅
+Now log out completely:
+
+```bash
+exit   # log out of dockeruser session
+```
+
+Wait a few seconds, then log back in as `dockeruser`:
+
+```bash
+su - dockeruser
+docker ps   # container is STILL running ✅
+```
+
+The container survived the logout because Docker is now managed by the system service, not by the user session. ✅
 
 ---
 
-### Step 16 — Run a Real Container (Extra Proof)
+### Step 20 — Run a Real Container (Extra Proof)
 
 ```bash
 docker run -it ubuntu:24.04 bash
 ```
 
-You're now inside an Ubuntu container! Try:
+Inside the container:
 
 ```bash
-whoami               # shows 'root' INSIDE the container only — NOT on the host
+whoami               # shows 'root' INSIDE container only — NOT on host
 cat /etc/os-release  # shows Ubuntu container info
 exit                 # leave the container
 ```
@@ -422,8 +545,7 @@ exit                 # leave the container
 
 ## 🔧 Bonus — Fix Low Ports (80, 443) — Admin Must Do This
 
-Since `dockeruser` has no sudo, the admin needs to apply this fix.
-Switch back to your admin user first, then run:
+Since `dockeruser` has no sudo, the admin applies this fix:
 
 ```bash
 # Temporary fix (resets on reboot)
@@ -442,53 +564,75 @@ After this, `dockeruser` can bind to ports 80, 443, etc. in their containers.
 
 ```bash
 # ══════════════════════════════════════════════════════════════
-# PHASE 1–3: RUN AS ADMIN (the user with sudo)
+# PHASE 1–3: AS ADMIN
 # ══════════════════════════════════════════════════════════════
 
 # System setup
 sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y curl wget git nano
 
-# Create user — NO SUDO GROUP, ever
+# Create user — ZERO sudo, ever
 sudo adduser dockeruser
-sudo usermod -aG systemd-journal dockeruser   # optional, logs only
+sudo usermod -aG systemd-journal dockeruser   # optional
 
-# Verify: must NOT show sudo
+# Verify — must NOT show sudo
 groups dockeruser   # expected: dockeruser systemd-journal
 
-# Install Docker Engine
+# Install Docker
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
-docker --version    # verify
+docker --version
 
-# Install rootless extras + all dependencies
+# Install rootless packages
 sudo apt-get install -y docker-ce-rootless-extras
 sudo apt-get install -y uidmap dbus-user-session slirp4netns
 
-# Enable linger — must be done as admin
-sudo loginctl enable-linger dockeruser
-loginctl show-user dockeruser | grep Linger   # should show: Linger=yes
-
 # ══════════════════════════════════════════════════════════════
-# PHASE 4–5: SWITCH TO dockeruser — ZERO SUDO FROM HERE ON
+# PHASE 4: AS dockeruser — ZERO SUDO
 # ══════════════════════════════════════════════════════════════
 su - dockeruser
 whoami   # must output: dockeruser
 
-# Rootless setup — NO sudo at all!
+# Run rootless setup
 dockerd-rootless-setuptool.sh install
+# On EC2 you will see "systemd not detected" — this is NORMAL
 
-echo 'export PATH=/usr/bin:$PATH' >> ~/.bashrc
-echo 'export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' >> ~/.bashrc
+# Set environment variables (EC2 paths)
+echo 'export XDG_RUNTIME_DIR=/home/dockeruser/.docker/run' >> ~/.bashrc
+echo 'export PATH=/usr/bin:/sbin:/usr/sbin:$PATH' >> ~/.bashrc
+echo 'export DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock' >> ~/.bashrc
 source ~/.bashrc
 
-systemctl --user enable docker
-systemctl --user status docker   # verify: active (running)
+# Create socket directory
+mkdir -p /home/dockeruser/.docker/run
 
-# Final verification
+# ══════════════════════════════════════════════════════════════
+# PHASE 5: BACK TO ADMIN — Create System Service
+# ══════════════════════════════════════════════════════════════
+exit   # back to admin
+
+sudo nano /etc/systemd/system/docker-rootless-dockeruser.service
+# Paste the service file content (see Phase 5, Step 14)
+
+sudo systemctl daemon-reload
+sudo systemctl enable docker-rootless-dockeruser
+sudo systemctl start docker-rootless-dockeruser
+sudo systemctl status docker-rootless-dockeruser   # verify: active (running)
+
+# ══════════════════════════════════════════════════════════════
+# PHASE 6: FINAL VERIFICATION AS dockeruser
+# ══════════════════════════════════════════════════════════════
+su - dockeruser
 docker run hello-world
 docker info | grep -i rootless
 ps aux | grep dockerd   # must show dockeruser, NOT root
+
+# Logout test
+docker run -d --name test-survivor nginx
+docker ps           # running
+exit                # log out
+su - dockeruser
+docker ps           # still running after logout ✅
 ```
 
 ---
@@ -499,16 +643,21 @@ ps aux | grep dockerd   # must show dockeruser, NOT root
 |---|---|---|
 | Ports < 1024 (80, 443) | ❌ Blocked by default | Admin applies `sysctl` fix (Bonus section) |
 | `--privileged` containers | ❌ Not supported | Use regular Docker if needed |
-| Overlay networking | ⚠️ Limited | `slirp4netns` already installed in Step 9 |
-| Docker Compose | ✅ Works perfectly | No changes needed |
+| `systemctl --user` on EC2 | ❌ No user systemd | Use system service (Phase 5) |
+| Overlay networking | ⚠️ Limited | `slirp4netns` installed in Step 9 |
+| Docker Compose | ✅ Works | No changes needed |
 | Volume mounts | ✅ Works | No changes needed |
 | Docker Hub / pulling images | ✅ Works | No changes needed |
-| Auto-start on login | ✅ Works | Linger enabled by admin in Step 10 |
+| Survives logout | ✅ Works | System service handles it (Phase 5) |
+| Survives reboot | ✅ Works | `systemctl enable` in Step 15 |
+| Auto-restarts on crash | ✅ Works | `Restart=always` in service file |
 
 ---
 
 > 📝 **Personal Reference Guide**  
 > Created: March 2026  
-> Ubuntu Version: 24.04 LTS (Noble Numbat)  
+> Platform: AWS EC2 — Ubuntu 24.04 LTS (Noble Numbat)  
 > Docker Version: 27.x (Rootless)  
-> ✅ Fully corrected — dockeruser has zero sudo privileges
+> ✅ dockeruser has zero sudo privileges  
+> ✅ Docker survives logout and reboots via system service  
+> ✅ EC2 / no-systemd-user-session fully handled
