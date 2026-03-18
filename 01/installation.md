@@ -3,35 +3,57 @@
 
 ---
 
+## 🧠 The Core Concept — Why NO Sudo for dockeruser?
+
+The entire point of rootless Docker is **security isolation**:
+
+> If `dockeruser` has `sudo`, they can become root anytime.
+> That completely defeats the purpose of rootless mode.
+
+So the rule is simple:
+
+| Who | What They Do | Has Sudo? |
+|---|---|---|
+| **Admin/root** | System setup, install Docker engine, create user, prep dependencies | ✅ Yes |
+| **dockeruser** | Runs Docker, runs containers — nothing else | ❌ Never |
+
+---
+
 ## 🗺️ The Full Roadmap
 
 ```
 Fresh Ubuntu 24.04 VM
         ↓
-  Update the System
+[ADMIN] Update the System
         ↓
-  Create a New User
+[ADMIN] Install Essential Tools
         ↓
-  Give User Sudo Rights
+[ADMIN] Create dockeruser  ← NO sudo given to this user
         ↓
-  Switch to That User
+[ADMIN] Install Docker Engine
         ↓
-  Install Docker Engine  ← (one-time root step)
+[ADMIN] Install docker-ce-rootless-extras
         ↓
-  Install Rootless Deps
+[ADMIN] Install Rootless Dependencies  ← must be done before switching user
         ↓
-  Setup Docker Rootless  ← (as the new user!)
+[ADMIN] Enable Linger for dockeruser   ← requires root, do it now
         ↓
-  Test & Verify ✅
+[SWITCH] su - dockeruser
+        ↓
+[dockeruser] Setup Docker Rootless
+        ↓
+[dockeruser] Set Environment Variables
+        ↓
+[dockeruser] Test & Verify ✅
 ```
 
 ---
 
-## 🖥️ Phase 1 — Fresh Ubuntu 24.04 VM Setup
+## 🖥️ Phase 1 — System Setup (As Admin)
 
 ### Step 1 — First Login & Update Everything
 
-When you first log in to your Ubuntu VM (usually as `root` or a default user), always update first:
+When you first log in to your Ubuntu VM (usually as `root` or a default admin user), always update first:
 
 ```bash
 sudo apt-get update && sudo apt-get upgrade -y
@@ -65,7 +87,7 @@ sudo apt-get install -y curl wget git nano
 
 ---
 
-## 👤 Phase 2 — Create a New User
+## 👤 Phase 2 — Create dockeruser (As Admin — NO Sudo Given!)
 
 ### Step 3 — Create the New User
 
@@ -73,7 +95,7 @@ sudo apt-get install -y curl wget git nano
 sudo adduser dockeruser
 ```
 
-> 💡 Replace `dockeruser` with whatever username you want — `yourname`, `devuser`, `john`, etc.
+> 💡 Replace `dockeruser` with whatever username you want — `devuser`, `john`, etc.
 
 **What happens:** Ubuntu will ask you a few questions:
 
@@ -85,7 +107,7 @@ Adding new home directory `/home/dockeruser' ...
 New password:          ← type a strong password
 Retype new password:   ← confirm it
 
-Full Name []:     ← optional, can press Enter to skip
+Full Name []:     ← optional, press Enter to skip
 Room Number []:   ← press Enter
 Work Phone []:    ← press Enter
 Home Phone []:    ← press Enter
@@ -102,79 +124,49 @@ Is the information correct? [Y/n]  ← type Y and Enter
 
 ---
 
-### Step 4 — Give the User Sudo Privileges
+### Step 4 — ❌ Do NOT Give Sudo Privileges
 
 ```bash
-sudo usermod -aG sudo dockeruser
+# ❌ NEVER run this for dockeruser:
+# sudo usermod -aG sudo dockeruser   ← DO NOT DO THIS
+
+# ✅ This user must have ZERO sudo — that's the whole point of rootless Docker
 ```
 
-**What this does:**
-- `usermod` — Modifies a user account
-- `-aG sudo` — **Appends** the user to the `sudo` group (capital G = group)
-- Without this, the user can't run `sudo` commands
-
-**Proof it worked:**
-```bash
-groups dockeruser
-```
-Expected output:
-```
-dockeruser : dockeruser sudo
-```
-You should see `sudo` in the list. ✅
+If `dockeruser` could run `sudo`, they could just `sudo su` and become root instantly. The entire security boundary would be pointless.
 
 ---
 
-### Step 5 — Also Add User to `systemd-journal` Group (Optional but Useful)
+### Step 5 — Optionally Add to systemd-journal Group
 
 ```bash
 sudo usermod -aG systemd-journal dockeruser
 ```
 
-This lets your user read system logs — helpful for debugging Docker later.
+This lets `dockeruser` read system logs — helpful for debugging Docker later. This is the **only** group addition needed, and it does NOT grant any elevated privileges.
 
 ---
 
-### Step 6 — Switch to the New User
+### Step 6 — Verify the User Has No Sudo
 
 ```bash
-su - dockeruser
+groups dockeruser
 ```
 
-The `-` means it's a **full login switch** — loads all the user's environment variables and starts from their home directory.
-
-**Proof you switched:**
-```bash
-whoami
+Expected output:
 ```
-Output should be:
-```
-dockeruser
+dockeruser : dockeruser systemd-journal
 ```
 
-And:
-```bash
-pwd
-```
-Output should be:
-```
-/home/dockeruser
-```
+✅ You should **NOT** see `sudo` in this list. If you do — you made a mistake in Step 4.
 
 ---
 
-## 🐳 Phase 3 — Install Docker (As Root, One Time)
+## 🐳 Phase 3 — Install Docker Engine (Admin, One Time)
 
-### Step 7 — Install Docker Engine
+### Step 7 — Download and Run Docker's Official Installer
 
-Open a new terminal or switch back to your original user/root for this step:
-
-```bash
-su - root
-# or open a new terminal tab and SSH in as your original user with sudo
-```
-
-Now install Docker:
+Still as your admin user, install Docker Engine:
 
 ```bash
 curl -fsSL https://get.docker.com -o get-docker.sh
@@ -182,9 +174,9 @@ sudo sh get-docker.sh
 ```
 
 **What the flags mean:**
-- `-f` — Fail silently on HTTP errors (no junk output)
+- `-f` — Fail silently on HTTP errors
 - `-s` — Silent mode
-- `-S` — Show errors if they happen
+- `-S` — Still show errors if they happen
 - `-L` — Follow redirects
 
 **This installs:**
@@ -204,40 +196,99 @@ Docker version 27.x.x, build xxxxxxx
 
 ---
 
-## 🔐 Phase 4 — Setup Docker Rootless (As Your New User!)
+### Step 8 — Install docker-ce-rootless-extras ← Critical Step!
 
-Now switch to your new user:
+This package is **required and often missed**. The `dockerd-rootless-setuptool.sh` script — which actually sets up rootless mode — lives inside this package:
+
+```bash
+sudo apt-get install -y docker-ce-rootless-extras
+```
+
+**Proof it worked:**
+```bash
+which dockerd-rootless-setuptool.sh
+```
+Expected output:
+```
+/usr/bin/dockerd-rootless-setuptool.sh
+```
+
+If this returns nothing, the rootless setup in Phase 4 will fail with "command not found". ✅
+
+---
+
+### Step 9 — Install All Rootless Dependencies (Admin Must Do This!)
+
+```bash
+sudo apt-get install -y uidmap dbus-user-session slirp4netns
+```
+
+> ⚠️ **This MUST be done by admin BEFORE switching to dockeruser.**
+> `dockeruser` has no sudo and cannot install packages themselves.
+
+**What each package does:**
+| Package | Purpose |
+|---|---|
+| `uidmap` | Maps user IDs — lets Docker create isolated user namespaces without root |
+| `dbus-user-session` | Lets a non-root user run background services like the Docker daemon |
+| `slirp4netns` | Provides user-space networking for rootless containers — needed for internet access inside containers |
+
+---
+
+### Step 10 — Enable Linger for dockeruser (Admin Must Do This!)
+
+```bash
+sudo loginctl enable-linger dockeruser
+```
+
+> ⚠️ **This also MUST be done by admin.** It requires root privileges and `dockeruser` can't run it themselves.
+
+**What this does:** Allows `dockeruser`'s systemd services (like the Docker daemon) to keep running even when they're not actively logged in. Without this, Docker shuts down the moment `dockeruser` logs out.
+
+**Proof it worked:**
+```bash
+loginctl show-user dockeruser | grep Linger
+```
+Expected output:
+```
+Linger=yes
+```
+
+---
+
+## 🔐 Phase 4 — Setup Docker Rootless (As dockeruser — Zero Sudo!)
+
+Now switch to the new user. **From this point forward, NO sudo is used at all.**
 
 ```bash
 su - dockeruser
 ```
 
-### Step 8 — Install Rootless Dependencies
+The `-` means it's a **full login switch** — loads the user's environment and starts from their home directory.
 
+**Proof you switched:**
 ```bash
-sudo apt-get install -y uidmap dbus-user-session
+whoami
 ```
-
-**What these are:**
-| Package | Purpose |
-|---|---|
-| `uidmap` | Maps user IDs — lets Docker create isolated user namespaces |
-| `dbus-user-session` | Lets your user run background services (like the Docker daemon) |
+Output:
+```
+dockeruser
+```
 
 ---
 
-### Step 9 — Run the Rootless Setup Script
+### Step 11 — Run the Rootless Setup Script
 
 ```bash
 dockerd-rootless-setuptool.sh install
 ```
 
-> ⚠️ **NO `sudo` here!** Run this as `dockeruser` directly.
+> ✅ No `sudo`. No root. Just run it directly as `dockeruser`.
 
 **What this does:**
 - Sets up a private Docker daemon that belongs only to `dockeruser`
-- Creates a systemd user service for Docker
-- Configures user namespaces
+- Creates a user-level systemd service at `~/.config/systemd/user/docker.service`
+- Configures user namespaces using `uidmap`
 
 **Proof it worked — expected output:**
 ```
@@ -248,16 +299,16 @@ dockerd-rootless-setuptool.sh install
 [INFO] Docker is now available as a rootless daemon.
 ```
 
-**If you see an error** about `newuidmap` or `newgidmap`:
+**If you see an error about `newuidmap` or `newgidmap`:**
+Switch back to admin and run:
 ```bash
 sudo apt-get install -y uidmap
-# then retry
-dockerd-rootless-setuptool.sh install
 ```
+Then switch back to `dockeruser` and retry.
 
 ---
 
-### Step 10 — Set Environment Variables
+### Step 12 — Set Environment Variables
 
 ```bash
 echo 'export PATH=/usr/bin:$PATH' >> ~/.bashrc
@@ -278,20 +329,19 @@ Expected output:
 ```
 unix:///run/user/1001/docker.sock
 ```
-(The number `1001` is your user's ID — it may differ)
+The number `1001` is `dockeruser`'s UID — it may differ on your system.
 
 ---
 
-### Step 11 — Enable Docker to Start on Login
+### Step 13 — Enable Docker to Auto-Start on Login
 
 ```bash
 systemctl --user enable docker
-sudo loginctl enable-linger dockeruser
 ```
 
-**What this does:**
-- `systemctl --user enable docker` → Auto-starts Docker when `dockeruser` logs in
-- `loginctl enable-linger` → Keeps Docker running even when `dockeruser` isn't actively logged in (critical for servers)
+> ✅ The `--user` flag means this operates only on `dockeruser`'s own services. No sudo needed.
+
+**What this does:** Auto-starts the rootless Docker daemon every time `dockeruser` logs in.
 
 **Proof:**
 ```bash
@@ -306,9 +356,9 @@ Expected output:
 
 ---
 
-## ✅ Phase 5 — Final Testing & Proof
+## ✅ Phase 5 — Final Testing & Proof (Still as dockeruser)
 
-### Step 12 — Run the Hello World Container
+### Step 14 — Run the Hello World Container
 
 ```bash
 docker run hello-world
@@ -326,11 +376,11 @@ To generate this message, Docker took the following steps:
  4. The Docker daemon streamed that output to the Docker client...
 ```
 
-🎉 **If you see this — you're fully done!**
+🎉 **If you see this — rootless Docker is fully working!**
 
 ---
 
-### Step 13 — Confirm It's Running Rootless
+### Step 15 — Confirm It's Actually Running Rootless
 
 ```bash
 docker info | grep -i rootless
@@ -342,7 +392,7 @@ Expected output:
  Security Options: rootless
 ```
 
-Also confirm the daemon is NOT running as root:
+Confirm the daemon is NOT running as root:
 
 ```bash
 ps aux | grep dockerd
@@ -352,7 +402,7 @@ You should see `dockerd` running under **`dockeruser`**, NOT `root`. ✅
 
 ---
 
-### Step 14 — Run a Real Container (Extra Proof)
+### Step 16 — Run a Real Container (Extra Proof)
 
 ```bash
 docker run -it ubuntu:24.04 bash
@@ -361,16 +411,19 @@ docker run -it ubuntu:24.04 bash
 You're now inside an Ubuntu container! Try:
 
 ```bash
-whoami       # shows 'root' inside container (but NOT on host)
-cat /etc/os-release   # shows Ubuntu info
-exit         # leave the container
+whoami               # shows 'root' INSIDE the container only — NOT on the host
+cat /etc/os-release  # shows Ubuntu container info
+exit                 # leave the container
 ```
+
+> 💡 Even though `whoami` shows `root` inside the container, on the **host machine** the process is running as `dockeruser`. That's rootless working correctly.
 
 ---
 
-## 🔧 Bonus — Fix Low Ports (80, 443, etc.)
+## 🔧 Bonus — Fix Low Ports (80, 443) — Admin Must Do This
 
-By default, non-root users can't bind to ports below 1024. Fix it:
+Since `dockeruser` has no sudo, the admin needs to apply this fix.
+Switch back to your admin user first, then run:
 
 ```bash
 # Temporary fix (resets on reboot)
@@ -381,45 +434,61 @@ echo "net.ipv4.ip_unprivileged_port_start=80" | sudo tee /etc/sysctl.d/99-rootle
 sudo sysctl --system
 ```
 
+After this, `dockeruser` can bind to ports 80, 443, etc. in their containers.
+
 ---
 
 ## 📋 Complete Summary — Every Command in Order
 
 ```bash
-# ── PHASE 1: System Setup ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# PHASE 1–3: RUN AS ADMIN (the user with sudo)
+# ══════════════════════════════════════════════════════════════
+
+# System setup
 sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y curl wget git nano
 
-# ── PHASE 2: Create User ───────────────────────────────────
+# Create user — NO SUDO GROUP, ever
 sudo adduser dockeruser
-sudo usermod -aG sudo dockeruser
-sudo usermod -aG systemd-journal dockeruser
+sudo usermod -aG systemd-journal dockeruser   # optional, logs only
 
-# Verify user
-groups dockeruser         # should show: dockeruser sudo
-su - dockeruser           # switch to new user
-whoami                    # should output: dockeruser
+# Verify: must NOT show sudo
+groups dockeruser   # expected: dockeruser systemd-journal
 
-# ── PHASE 3: Install Docker Engine (as root/sudo) ──────────
+# Install Docker Engine
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
-docker --version          # verify install
+docker --version    # verify
 
-# ── PHASE 4: Rootless Setup (as dockeruser) ────────────────
-sudo apt-get install -y uidmap dbus-user-session
-dockerd-rootless-setuptool.sh install    # NO sudo!
+# Install rootless extras + all dependencies
+sudo apt-get install -y docker-ce-rootless-extras
+sudo apt-get install -y uidmap dbus-user-session slirp4netns
+
+# Enable linger — must be done as admin
+sudo loginctl enable-linger dockeruser
+loginctl show-user dockeruser | grep Linger   # should show: Linger=yes
+
+# ══════════════════════════════════════════════════════════════
+# PHASE 4–5: SWITCH TO dockeruser — ZERO SUDO FROM HERE ON
+# ══════════════════════════════════════════════════════════════
+su - dockeruser
+whoami   # must output: dockeruser
+
+# Rootless setup — NO sudo at all!
+dockerd-rootless-setuptool.sh install
 
 echo 'export PATH=/usr/bin:$PATH' >> ~/.bashrc
 echo 'export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' >> ~/.bashrc
 source ~/.bashrc
 
 systemctl --user enable docker
-sudo loginctl enable-linger dockeruser
+systemctl --user status docker   # verify: active (running)
 
-# ── PHASE 5: Verify ────────────────────────────────────────
+# Final verification
 docker run hello-world
 docker info | grep -i rootless
-ps aux | grep dockerd     # should show dockeruser, NOT root
+ps aux | grep dockerd   # must show dockeruser, NOT root
 ```
 
 ---
@@ -428,16 +497,18 @@ ps aux | grep dockerd     # should show dockeruser, NOT root
 
 | Feature | Status | Fix/Workaround |
 |---|---|---|
-| Ports < 1024 (80, 443) | ❌ Blocked | Use `sysctl` fix above |
-| `--privileged` mode | ❌ Not supported | Use regular Docker |
-| Overlay networking | ⚠️ Limited | Use `slirp4netns` |
+| Ports < 1024 (80, 443) | ❌ Blocked by default | Admin applies `sysctl` fix (Bonus section) |
+| `--privileged` containers | ❌ Not supported | Use regular Docker if needed |
+| Overlay networking | ⚠️ Limited | `slirp4netns` already installed in Step 9 |
 | Docker Compose | ✅ Works perfectly | No changes needed |
 | Volume mounts | ✅ Works | No changes needed |
 | Docker Hub / pulling images | ✅ Works | No changes needed |
+| Auto-start on login | ✅ Works | Linger enabled by admin in Step 10 |
 
 ---
 
 > 📝 **Personal Reference Guide**  
 > Created: March 2026  
 > Ubuntu Version: 24.04 LTS (Noble Numbat)  
-> Docker Version: 27.x (Rootless)
+> Docker Version: 27.x (Rootless)  
+> ✅ Fully corrected — dockeruser has zero sudo privileges
