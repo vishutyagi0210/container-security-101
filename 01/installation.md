@@ -10,41 +10,30 @@ The entire point of rootless Docker is **security isolation**:
 > If `dockeruser` has `sudo`, they can become root anytime.
 > That completely defeats the purpose of rootless mode.
 
-So the rule is simple:
-
 | Who | What They Do | Has Sudo? |
 |---|---|---|
-| **Admin/root** | System setup, install Docker, create user, create system service | ✅ Yes |
+| **Admin** (`ubuntu`) | System setup, install Docker, create user, create system service | ✅ Yes |
 | **dockeruser** | Runs Docker, runs containers — nothing else | ❌ Never |
 
 ---
 
-## ⚠️ EC2 vs Regular VM — Important Difference
+## ⚠️ EC2 Reality — What's Different from a Regular VM
 
-On a regular Ubuntu VM or desktop, Docker rootless uses **systemd user sessions** to manage the daemon automatically.
+On a regular Ubuntu VM, Docker rootless uses **systemd user sessions** automatically.
+On AWS EC2, **systemd user sessions are NOT available** for non-root users. This causes two problems if not handled:
 
-**On AWS EC2, systemd user sessions are NOT available for non-root users.** So when you run `dockerd-rootless-setuptool.sh install` on EC2 you will see:
+- `systemctl --user` doesn't work → Docker won't auto-start
+- systemd blocks cgroup creation per container → every `docker run` crashes
 
-```
-[INFO] systemd not detected, dockerd-rootless.sh needs to be started manually:
-PATH=/usr/bin:/sbin:/usr/sbin:$PATH dockerd-rootless.sh
-```
-
-This is **not an error** — it's just telling you systemd user mode isn't available.
-
-The fix: **Admin creates a system-level service** (using system systemd, which IS available) that runs `dockerd-rootless.sh` as `dockeruser`. This way:
-- Docker starts automatically on boot
-- Docker keeps running even when `dockeruser` is logged out
-- If Docker crashes, it auto-restarts
-- `dockeruser` still has zero sudo
+Both are solved in this guide.
 
 | | Regular VM | AWS EC2 |
 |---|---|---|
 | Systemd user session | ✅ Available | ❌ Not available |
 | `systemctl --user` | ✅ Works | ❌ Doesn't work |
-| Solution | `systemctl --user enable docker` | Admin creates system service |
+| cgroup delegation | ✅ Auto-handled | ❌ Must be explicitly configured |
 | Docker socket path | `/run/user/1001/docker.sock` | `/home/dockeruser/.docker/run/docker.sock` |
-| cgroup delegation | ✅ Auto-handled by user session | ❌ Must be explicitly granted — or containers crash |
+| Solution for daemon | `systemctl --user enable docker` | Admin creates a system-level service |
 | App survives logout | ✅ Yes (with linger) | ✅ Yes (with system service) |
 
 ---
@@ -54,17 +43,13 @@ The fix: **Admin creates a system-level service** (using system systemd, which I
 ```
 Fresh Ubuntu 24.04 EC2 Instance
         ↓
-[ADMIN] Update the System
+[ADMIN] Update System + Install Tools
         ↓
-[ADMIN] Install Essential Tools
+[ADMIN] Create dockeruser — NO sudo, ever
         ↓
-[ADMIN] Create dockeruser  ← NO sudo, ever
+[ADMIN] Install Docker Engine + rootless-extras + dependencies
         ↓
-[ADMIN] Install Docker Engine
-        ↓
-[ADMIN] Install docker-ce-rootless-extras  ← where the setup script lives
-        ↓
-[ADMIN] Install Rootless Dependencies (uidmap, slirp4netns, etc.)
+[ADMIN] Create daemon.json with cgroupfs driver
         ↓
 [SWITCH] su - dockeruser
         ↓
@@ -74,9 +59,9 @@ Fresh Ubuntu 24.04 EC2 Instance
         ↓
 [SWITCH BACK TO ADMIN]
         ↓
-[ADMIN] Create system-level service for dockerd-rootless
+[ADMIN] Create system-level service (with Delegate=yes)
         ↓
-[ADMIN] Enable cgroup Delegation  ← required on EC2, or containers crash
+[ADMIN] Create cgroup delegation config
         ↓
 [ADMIN] Enable + Start the service
         ↓
@@ -87,20 +72,15 @@ Fresh Ubuntu 24.04 EC2 Instance
 
 ## 🖥️ Phase 1 — System Setup (As Admin)
 
-### Step 1 — First Login & Update Everything
+### Step 1 — Update Everything
 
-When you first log in to your EC2 instance (usually as `ubuntu` user), always update first:
+Log in as `ubuntu` (the default EC2 admin user) and update first:
 
 ```bash
 sudo apt-get update && sudo apt-get upgrade -y
 ```
 
-**What this does:**
-- `apt-get update` — Refreshes the list of available packages
-- `apt-get upgrade -y` — Installs all updates automatically
-- Always do this on a fresh instance before installing anything
-
-**Proof it worked:** No errors in output. Ends with something like:
+**Proof it worked:**
 ```
 0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
 ```
@@ -113,10 +93,10 @@ sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y curl wget git nano
 ```
 
-| Tool | Why You Need It |
+| Tool | Purpose |
 |---|---|
-| `curl` | Downloads files/scripts from the internet |
-| `wget` | Another download tool (good backup) |
+| `curl` | Downloads scripts from the internet |
+| `wget` | Another download tool |
 | `git` | Version control |
 | `nano` | Simple terminal text editor |
 
@@ -130,45 +110,33 @@ sudo apt-get install -y curl wget git nano
 sudo adduser dockeruser
 ```
 
-> 💡 Replace `dockeruser` with whatever username you want.
-
 Ubuntu will ask you a few questions:
 
 ```
-Adding user `dockeruser' ...
-Adding new group `dockeruser' (1001) ...
-Adding new home directory `/home/dockeruser' ...
-
 New password:          ← type a strong password
 Retype new password:   ← confirm it
-
-Full Name []:          ← press Enter to skip
-Room Number []:        ← press Enter
-Work Phone []:         ← press Enter
-Home Phone []:         ← press Enter
-Other []:              ← press Enter
-
-Is the information correct? [Y/n]  ← type Y and Enter
+Full Name []:          ← press Enter to skip all fields
+...
+Is the information correct? [Y/n]  ← Y + Enter
 ```
 
 **What `adduser` does automatically:**
-- Creates the user account
-- Creates their home folder at `/home/dockeruser`
+- Creates the account and home folder at `/home/dockeruser`
 - Creates a group with the same name
-- Sets up their shell as `/bin/bash`
+- Sets up `/bin/bash` as the shell
 
 ---
 
 ### Step 4 — ❌ Do NOT Give Sudo Privileges
 
 ```bash
-# ❌ NEVER run this for dockeruser:
+# ❌ NEVER run this:
 # sudo usermod -aG sudo dockeruser   ← DO NOT DO THIS
 
-# ✅ This user must have ZERO sudo — that's the whole point of rootless Docker
+# ✅ dockeruser must have ZERO sudo — that's the whole point
 ```
 
-If `dockeruser` could run `sudo`, they could just `sudo su` and become root instantly. The entire security boundary would be pointless.
+If `dockeruser` had sudo, they could `sudo su` and become root instantly. The security boundary would be completely pointless.
 
 ---
 
@@ -178,11 +146,11 @@ If `dockeruser` could run `sudo`, they could just `sudo su` and become root inst
 sudo usermod -aG systemd-journal dockeruser
 ```
 
-This lets `dockeruser` read system logs — helpful for debugging Docker later. This does NOT grant any elevated privileges.
+Lets `dockeruser` read system logs for debugging. No elevated privileges granted.
 
 ---
 
-### Step 6 — Verify the User Has No Sudo
+### Step 6 — Verify No Sudo
 
 ```bash
 groups dockeruser
@@ -193,50 +161,48 @@ Expected output:
 dockeruser : dockeruser systemd-journal
 ```
 
-✅ You should **NOT** see `sudo` in this list. If you do, you made a mistake in Step 4.
+✅ `sudo` must NOT appear here. If it does, you made a mistake in Step 4.
 
 ---
 
-## 🐳 Phase 3 — Install Docker Engine (Admin, One Time)
+## 🐳 Phase 3 — Install Docker (As Admin)
 
-### Step 7 — Download and Run Docker's Official Installer
+### Step 7 — Install Docker Engine
 
 ```bash
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
 ```
 
-**This installs:**
-- `docker-ce` — Docker Community Edition (the engine)
-- `docker-ce-cli` — The `docker` command-line tool
-- `containerd.io` — The container runtime
-- `docker-compose-plugin` — Docker Compose (built-in now)
+**Installs:**
+- `docker-ce` — Docker Community Edition
+- `docker-ce-cli` — The `docker` CLI tool
+- `containerd.io` — Container runtime
+- `docker-compose-plugin` — Docker Compose (built-in)
 
-**Proof it worked:**
+**Proof:**
 ```bash
 docker --version
 ```
-Expected output:
 ```
 Docker version 27.x.x, build xxxxxxx
 ```
 
 ---
 
-### Step 8 — Install docker-ce-rootless-extras ← Critical, Don't Skip!
+### Step 8 — Install docker-ce-rootless-extras ← Critical!
 
-The `dockerd-rootless-setuptool.sh` and `dockerd-rootless.sh` scripts live inside this package. Without it, rootless mode simply doesn't exist:
+This package contains `dockerd-rootless-setuptool.sh` and `dockerd-rootless.sh` — without it, rootless mode doesn't exist:
 
 ```bash
 sudo apt-get install -y docker-ce-rootless-extras
 ```
 
-**Proof it worked:**
+**Proof:**
 ```bash
 which dockerd-rootless-setuptool.sh
 which dockerd-rootless.sh
 ```
-Expected output:
 ```
 /usr/bin/dockerd-rootless-setuptool.sh
 /usr/bin/dockerd-rootless.sh
@@ -244,51 +210,78 @@ Expected output:
 
 ---
 
-### Step 9 — Install All Rootless Dependencies (Admin Must Do This!)
+### Step 9 — Install All Rootless Dependencies
 
 ```bash
 sudo apt-get install -y uidmap dbus-user-session slirp4netns
 ```
 
-> ⚠️ **MUST be done by admin BEFORE switching to dockeruser.**
-> `dockeruser` has no sudo and cannot install packages themselves.
+> ⚠️ Must be done by admin. `dockeruser` has no sudo and cannot install packages.
 
 | Package | Purpose |
 |---|---|
-| `uidmap` | Maps user IDs — lets Docker create isolated user namespaces without root |
+| `uidmap` | Maps user IDs for isolated user namespaces without root |
 | `dbus-user-session` | Lets a non-root user run background services |
-| `slirp4netns` | User-space networking for rootless containers — needed for internet access inside containers |
+| `slirp4netns` | User-space networking — gives containers internet access |
+
+---
+
+### Step 10 — Create daemon.json with cgroupfs Driver ← Critical for EC2!
+
+On EC2, Docker's default cgroup manager tries to create systemd scope units per container, which requires polkit authentication that never comes — causing every `docker run` to fail with:
+
+```
+unable to apply cgroup configuration... Interactive authentication required
+```
+
+The fix is to tell Docker to use `cgroupfs` directly instead:
+
+```bash
+sudo mkdir -p /home/dockeruser/.config/docker
+sudo bash -c 'cat > /home/dockeruser/.config/docker/daemon.json << EOF
+{
+  "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+EOF'
+sudo chown -R dockeruser:dockeruser /home/dockeruser/.config/docker
+```
+
+**What this does:**
+- `exec-opts: native.cgroupdriver=cgroupfs` → Docker writes directly to the cgroup filesystem instead of asking systemd to create scope units
+- `chown` → Makes sure `dockeruser` owns their own config (not root)
+
+**Proof:**
+```bash
+sudo cat /home/dockeruser/.config/docker/daemon.json
+```
+```json
+{
+  "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+```
 
 ---
 
 ## 🔐 Phase 4 — Setup Docker Rootless (As dockeruser — Zero Sudo!)
 
-Switch to the new user. **From this point forward, NO sudo is used at all.**
+Switch to the new user. **No sudo used from this point forward.**
 
 ```bash
 su - dockeruser
-```
-
-**Proof you switched:**
-```bash
-whoami
-```
-Output:
-```
-dockeruser
+whoami   # must output: dockeruser
 ```
 
 ---
 
-### Step 10 — Run the Rootless Setup Script
+### Step 11 — Run the Rootless Setup Script
 
 ```bash
 dockerd-rootless-setuptool.sh install
 ```
 
-> ✅ No `sudo`. No root. Run it directly as `dockeruser`.
+> ✅ No `sudo`. No root. Run directly as `dockeruser`.
 
-**On EC2, the expected output will be:**
+**On EC2, the expected output is:**
 ```
 [INFO] systemd not detected, dockerd-rootless.sh needs to be started manually:
 PATH=/usr/bin:/sbin:/usr/sbin:$PATH dockerd-rootless.sh
@@ -296,20 +289,16 @@ PATH=/usr/bin:/sbin:/usr/sbin:$PATH dockerd-rootless.sh
 [INFO] Using CLI context "rootless"
 Current context is now "rootless"
 [INFO] Make sure the following environment variable(s) are set (or add them to ~/.bashrc):
-# WARNING: systemd not found. You have to remove XDG_RUNTIME_DIR manually on every logout.
 export XDG_RUNTIME_DIR=/home/dockeruser/.docker/run
 export PATH=/usr/bin:$PATH
-[INFO] Some applications may require the following environment variable too:
 export DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock
 ```
 
-✅ This is **correct and expected on EC2** — not an error. The "systemd not detected" message just means we'll use the system-level service approach (done by admin in Phase 5).
+✅ "systemd not detected" is **normal and expected on EC2** — not an error. The system-level service we create in Phase 5 handles this.
 
 ---
 
-### Step 11 — Set Environment Variables
-
-Based on exactly what the setup script told you, add these to `~/.bashrc`:
+### Step 12 — Set Environment Variables
 
 ```bash
 echo 'export XDG_RUNTIME_DIR=/home/dockeruser/.docker/run' >> ~/.bashrc
@@ -318,19 +307,17 @@ echo 'export DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock' >> ~/.
 source ~/.bashrc
 ```
 
-**What each variable does:**
 | Variable | Purpose |
 |---|---|
 | `XDG_RUNTIME_DIR` | Tells Docker where to create its socket and runtime files |
 | `PATH` | Makes sure all Docker binaries are findable |
-| `DOCKER_HOST` | Tells the Docker CLI exactly where the daemon socket is |
+| `DOCKER_HOST` | Tells the Docker CLI exactly where the daemon socket lives |
 
-**Proof they're set:**
+**Proof:**
 ```bash
 echo $XDG_RUNTIME_DIR
 echo $DOCKER_HOST
 ```
-Expected output:
 ```
 /home/dockeruser/.docker/run
 unix:///home/dockeruser/.docker/run/docker.sock
@@ -338,41 +325,33 @@ unix:///home/dockeruser/.docker/run/docker.sock
 
 ---
 
-### Step 12 — Create the Runtime Directory
+### Step 13 — Create the Runtime Directory
 
 ```bash
 mkdir -p /home/dockeruser/.docker/run
 ```
 
-This is where the Docker socket will live. The system service will also create this automatically, but good to have it ready.
+This is where the Docker socket will live. The system service also creates it via `ExecStartPre`, but good to have it ready manually too.
 
 ---
 
 ## 🛠️ Phase 5 — Create System Service (Back to Admin!)
 
-Switch back to your admin user. This is the key phase that makes Docker survive logouts and reboots.
+Switch back to admin:
 
 ```bash
-exit   # or open a new terminal as admin
+exit
 ```
 
-### Step 13 — Why Not Just Use `.bashrc` to Start Docker?
+### Why a System Service?
 
-You might think: just add `dockerd-rootless.sh &` to `~/.bashrc` and be done.
+Without this, the moment `dockeruser` logs out — Docker dies and so does every running container.
 
-**The problem:**
-
-```
-dockeruser logs in → .bashrc starts dockerd → app runs
-dockeruser logs OUT → session ends → dockerd dies → app CRASHES 💥
-EC2 reboots → dockerd never starts → app never runs 💥
-```
-
-**The solution:** A proper **system-level** service that:
-- Starts at boot, independently of any login
-- Runs `dockerd-rootless.sh` as `dockeruser` (still rootless!)
-- Keeps Docker alive even when `dockeruser` is completely logged out
-- Auto-restarts if Docker ever crashes
+A system-level service means:
+- Docker starts at **boot** — no login required
+- Docker keeps running even when `dockeruser` is **completely logged out**
+- Docker **auto-restarts** if it crashes
+- `dockeruser` still has **zero sudo**
 
 ---
 
@@ -406,34 +385,23 @@ Delegate=yes
 WantedBy=multi-user.target
 ```
 
-**What each section means:**
 | Setting | What It Does |
 |---|---|
 | `User=dockeruser` | Runs the daemon as `dockeruser` — NOT as root |
 | `ExecStartPre=mkdir` | Creates the socket directory before starting |
-| `ExecStart=dockerd-rootless.sh` | The actual rootless Docker daemon |
-| `Restart=always` | Auto-restarts if Docker crashes |
+| `ExecStart=dockerd-rootless.sh` | The actual rootless Docker daemon binary |
+| `Restart=always` | Auto-restarts Docker if it ever crashes |
 | `RestartSec=5` | Waits 5 seconds before restarting |
-| `Delegate=yes` | Allows the service to manage its own cgroup subtree — **required on EC2**, otherwise every `docker run` fails with "unable to apply cgroup configuration" |
-| `WantedBy=multi-user.target` | Starts at boot, at the normal runlevel |
+| `Delegate=yes` | Allows this service to manage its own cgroup subtree — required on EC2 |
+| `WantedBy=multi-user.target` | Starts automatically at boot |
 
 Save and exit: `Ctrl+O` → `Enter` → `Ctrl+X`
 
 ---
 
-### Step 15 — Enable cgroup Delegation for the User Slice ← Don't Skip on EC2!
+### Step 15 — Create cgroup Delegation Config ← Required on EC2!
 
-This is what was causing the container crash:
-
-```
-unable to apply cgroup configuration: unable to start unit... Interactive authentication required
-```
-
-On EC2, when Docker (running as a system service) tries to create a cgroup scope for each container, systemd blocks it unless delegation is explicitly granted. Two things are needed:
-
-**`Delegate=yes` in the service file** (already added in Step 14) tells systemd this service is allowed to manage its own cgroup subtree.
-
-**The user slice config** tells systemd which cgroup controllers to hand over to processes running under `dockeruser`:
+Even with `Delegate=yes` in the service file, you must also tell systemd which cgroup controllers to hand over to `dockeruser`'s slice. Without this, container isolation still fails:
 
 ```bash
 sudo mkdir -p /etc/systemd/system/user@.service.d/
@@ -449,64 +417,56 @@ Delegate=cpu cpuset io memory pids
 
 Save and exit: `Ctrl+O` → `Enter` → `Ctrl+X`
 
-**What this does:** Grants `dockeruser`'s processes full control over the `cpu`, `cpuset`, `io`, `memory`, and `pids` cgroup controllers — exactly what Docker needs to isolate containers. Without this, every `docker run` fails even if the daemon is running fine.
+**What this does:** Grants processes under `dockeruser`'s slice full control over `cpu`, `cpuset`, `io`, `memory`, and `pids` cgroup controllers — exactly what Docker needs to isolate each container.
 
 ---
 
 ### Step 16 — Enable and Start the Service
 
 ```bash
-# Reload systemd so it picks up both the service file AND the delegate.conf
+# Reload systemd — picks up the service file AND delegate.conf
 sudo systemctl daemon-reload
 
-# Enable it — auto-starts on every boot
+# Auto-start on every boot
 sudo systemctl enable docker-rootless-dockeruser
 
-# Start it right now
+# Start right now
 sudo systemctl start docker-rootless-dockeruser
 ```
 
----
-
-### Step 17 — Verify the Service Is Running
-
+**Proof it's running:**
 ```bash
 sudo systemctl status docker-rootless-dockeruser
 ```
-
-Expected output:
+Expected:
 ```
 ● docker-rootless-dockeruser.service - Docker Rootless Daemon (dockeruser)
-     Loaded: loaded (/etc/systemd/system/docker-rootless-dockeruser.service)
+     Loaded: loaded (/etc/systemd/system/docker-rootless-dockeruser.service; enabled)
      Active: active (running) since ...
    Main PID: XXXX (dockerd-rootless.)
 ```
 
-Also verify the process is owned by `dockeruser`, NOT root:
-
+Also confirm it's running as `dockeruser`, NOT root:
 ```bash
 ps aux | grep dockerd
 ```
-
 You should see `dockerd` listed under `dockeruser`. ✅
 
 ---
 
 ## ✅ Phase 6 — Final Testing & Proof (As dockeruser)
 
-Switch back to `dockeruser`:
-
 ```bash
 su - dockeruser
 ```
 
-### Step 18 — Run the Hello World Container
+### Step 17 — Run the Hello World Container
 
 ```bash
 docker run hello-world
 ```
 
-**Expected output:**
+Expected output:
 ```
 Hello from Docker!
 This message shows that your installation appears to be working correctly.
@@ -518,51 +478,54 @@ To generate this message, Docker took the following steps:
  4. The Docker daemon streamed that output to the Docker client...
 ```
 
-🎉 **If you see this — rootless Docker is fully working!**
+🎉 **If you see this — everything is working correctly!**
 
 ---
 
-### Step 19 — Confirm It's Actually Rootless
+### Step 18 — Confirm It's Actually Rootless
 
 ```bash
 docker info | grep -i rootless
 ```
-
-Expected output:
 ```
  rootlesskit
  Security Options: rootless
 ```
 
+```bash
+ps aux | grep dockerd
+```
+`dockerd` must appear under `dockeruser`, NOT `root`. ✅
+
 ---
 
-### Step 20 — Prove the App Survives Logout
+### Step 19 — Prove the App Survives Logout
 
-This is the ultimate test. Start a container in the background:
+Start a container in the background:
 
 ```bash
 docker run -d --name test-survivor nginx
 docker ps   # confirm it's running
 ```
 
-Now log out completely:
+Log out completely:
 
 ```bash
-exit   # log out of dockeruser session
+exit
 ```
 
-Wait a few seconds, then log back in as `dockeruser`:
+Log back in as `dockeruser`:
 
 ```bash
 su - dockeruser
 docker ps   # container is STILL running ✅
 ```
 
-The container survived the logout because Docker is now managed by the system service, not by the user session. ✅
+The container survived because Docker is managed by the system service — not by the user session. ✅
 
 ---
 
-### Step 21 — Run a Real Container (Extra Proof)
+### Step 20 — Run a Real Interactive Container
 
 ```bash
 docker run -it ubuntu:24.04 bash
@@ -572,28 +535,25 @@ Inside the container:
 
 ```bash
 whoami               # shows 'root' INSIDE container only — NOT on host
-cat /etc/os-release  # shows Ubuntu container info
-exit                 # leave the container
+cat /etc/os-release  # shows Ubuntu info
+exit
 ```
 
-> 💡 Even though `whoami` shows `root` inside the container, on the **host machine** the process is running as `dockeruser`. That's rootless working correctly.
+> 💡 `whoami` shows `root` inside the container, but on the **host** the process runs as `dockeruser`. That's rootless working exactly as designed.
 
 ---
 
 ## 🔧 Bonus — Fix Low Ports (80, 443) — Admin Must Do This
 
-Since `dockeruser` has no sudo, the admin applies this fix:
+`dockeruser` has no sudo so the admin applies this:
 
 ```bash
-# Temporary fix (resets on reboot)
-sudo sysctl net.ipv4.ip_unprivileged_port_start=80
-
 # Permanent fix (survives reboots)
 echo "net.ipv4.ip_unprivileged_port_start=80" | sudo tee /etc/sysctl.d/99-rootless-docker.conf
 sudo sysctl --system
 ```
 
-After this, `dockeruser` can bind to ports 80, 443, etc. in their containers.
+After this, `dockeruser` can bind containers to ports 80, 443, etc.
 
 ---
 
@@ -601,7 +561,7 @@ After this, `dockeruser` can bind to ports 80, 443, etc. in their containers.
 
 ```bash
 # ══════════════════════════════════════════════════════════════
-# PHASE 1–3: AS ADMIN
+# PHASE 1–3: AS ADMIN (ubuntu user)
 # ══════════════════════════════════════════════════════════════
 
 # System setup
@@ -610,19 +570,28 @@ sudo apt-get install -y curl wget git nano
 
 # Create user — ZERO sudo, ever
 sudo adduser dockeruser
-sudo usermod -aG systemd-journal dockeruser   # optional
+sudo usermod -aG systemd-journal dockeruser   # optional, for log reading only
 
-# Verify — must NOT show sudo
+# Verify — sudo must NOT appear
 groups dockeruser   # expected: dockeruser systemd-journal
 
-# Install Docker
+# Install Docker Engine
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
-docker --version
+docker --version   # verify
 
-# Install rootless packages
+# Install rootless package + dependencies
 sudo apt-get install -y docker-ce-rootless-extras
 sudo apt-get install -y uidmap dbus-user-session slirp4netns
+
+# Create daemon.json — switches cgroup driver to cgroupfs (fixes EC2 container crash)
+sudo mkdir -p /home/dockeruser/.config/docker
+sudo bash -c 'cat > /home/dockeruser/.config/docker/daemon.json << EOF
+{
+  "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+EOF'
+sudo chown -R dockeruser:dockeruser /home/dockeruser/.config/docker
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 4: AS dockeruser — ZERO SUDO
@@ -630,11 +599,10 @@ sudo apt-get install -y uidmap dbus-user-session slirp4netns
 su - dockeruser
 whoami   # must output: dockeruser
 
-# Run rootless setup
+# Rootless setup — "systemd not detected" on EC2 is NORMAL
 dockerd-rootless-setuptool.sh install
-# On EC2 you will see "systemd not detected" — this is NORMAL
 
-# Set environment variables (EC2 paths)
+# Set environment variables (EC2-specific paths)
 echo 'export XDG_RUNTIME_DIR=/home/dockeruser/.docker/run' >> ~/.bashrc
 echo 'export PATH=/usr/bin:/sbin:/usr/sbin:$PATH' >> ~/.bashrc
 echo 'export DOCKER_HOST=unix:///home/dockeruser/.docker/run/docker.sock' >> ~/.bashrc
@@ -644,67 +612,68 @@ source ~/.bashrc
 mkdir -p /home/dockeruser/.docker/run
 
 # ══════════════════════════════════════════════════════════════
-# PHASE 5: BACK TO ADMIN — Create System Service + cgroup Fix
+# PHASE 5: BACK TO ADMIN — System Service + cgroup Config
 # ══════════════════════════════════════════════════════════════
 exit   # back to admin
 
-# Create the system service file (with Delegate=yes inside)
+# Create system service file
 sudo nano /etc/systemd/system/docker-rootless-dockeruser.service
-# Paste the service file content (see Phase 5, Step 14)
+# (paste the [Unit][Service][Install] block from Phase 5 Step 14)
 
-# Create cgroup delegation config — REQUIRED on EC2 or containers crash
+# Create cgroup delegation config
 sudo mkdir -p /etc/systemd/system/user@.service.d/
 sudo nano /etc/systemd/system/user@.service.d/delegate.conf
-# Paste: [Service]
-#        Delegate=cpu cpuset io memory pids
+# (paste the [Service] Delegate= block from Phase 5 Step 15)
 
-# Reload systemd (picks up both files), enable and start
+# Reload systemd, enable and start
 sudo systemctl daemon-reload
 sudo systemctl enable docker-rootless-dockeruser
 sudo systemctl start docker-rootless-dockeruser
 sudo systemctl status docker-rootless-dockeruser   # verify: active (running)
+ps aux | grep dockerd                              # must show dockeruser, NOT root
 
 # ══════════════════════════════════════════════════════════════
-# PHASE 6: FINAL VERIFICATION AS dockeruser
+# PHASE 6: FINAL VERIFICATION — AS dockeruser
 # ══════════════════════════════════════════════════════════════
 su - dockeruser
-docker run hello-world
-docker info | grep -i rootless
-ps aux | grep dockerd   # must show dockeruser, NOT root
 
-# Logout test
+docker run hello-world                # must print "Hello from Docker!"
+docker info | grep -i rootless        # must show: Security Options: rootless
+
+# Logout survival test
 docker run -d --name test-survivor nginx
-docker ps           # running
-exit                # log out
+docker ps                             # running
+exit                                  # log out completely
 su - dockeruser
-docker ps           # still running after logout ✅
+docker ps                             # STILL running after logout ✅
 ```
 
 ---
 
-## ⚠️ Limitations of Rootless Docker
+## ⚠️ Limitations of Rootless Docker on EC2
 
-| Feature | Status | Fix/Workaround |
+| Feature | Status | Notes |
 |---|---|---|
 | Ports < 1024 (80, 443) | ❌ Blocked by default | Admin applies `sysctl` fix (Bonus section) |
-| `--privileged` containers | ❌ Not supported | Use regular Docker if needed |
-| `systemctl --user` on EC2 | ❌ No user systemd | Use system service (Phase 5) |
+| `--privileged` containers | ❌ Not supported | Use regular Docker if truly needed |
+| `systemctl --user` | ❌ No user systemd on EC2 | System service handles this (Phase 5) |
 | Overlay networking | ⚠️ Limited | `slirp4netns` installed in Step 9 |
 | Docker Compose | ✅ Works | No changes needed |
 | Volume mounts | ✅ Works | No changes needed |
-| Docker Hub / pulling images | ✅ Works | No changes needed |
-| Survives logout | ✅ Works | System service handles it (Phase 5) |
-| Survives reboot | ✅ Works | `systemctl enable` in Step 16 |
-| cgroup for containers | ✅ Works | `Delegate=yes` + delegate.conf in Step 15 |
+| Pulling images from Docker Hub | ✅ Works | No changes needed |
+| Survives user logout | ✅ Works | System service (Phase 5) |
+| Survives EC2 reboot | ✅ Works | `systemctl enable` (Step 16) |
 | Auto-restarts on crash | ✅ Works | `Restart=always` in service file |
+| cgroup isolation per container | ✅ Works | `cgroupfs` driver + `Delegate=yes` + delegate.conf |
 
 ---
 
-> 📝 **Personal Reference Guide**  
-> Created: March 2026  
-> Platform: AWS EC2 — Ubuntu 24.04 LTS (Noble Numbat)  
-> Docker Version: 27.x (Rootless)  
-> ✅ dockeruser has zero sudo privileges  
-> ✅ Docker survives logout and reboots via system service  
-> ✅ EC2 / no-systemd-user-session fully handled  
-> ✅ cgroup delegation fixed — containers run without errors
+> 📝 **Personal Reference Guide**
+> Created: March 2026
+> Platform: AWS EC2 — Ubuntu 24.04 LTS (Noble Numbat)
+> Docker Version: 27.x (Rootless)
+> ✅ dockeruser has zero sudo privileges
+> ✅ Docker daemon runs as system service — survives logout and reboots
+> ✅ cgroupfs driver — containers run without cgroup errors
+> ✅ cgroup delegation configured — full container isolation works
+> ✅ Battle-tested on EC2 — every issue encountered and fixed
